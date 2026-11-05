@@ -1,0 +1,13 @@
+# ESP-IDF 构建产物
+firmware/idf/build/
+idf/build/
+build/
+sdkconfig
+sdkconfig.old
+
+# VS Code（含本机绝对路径，不入库；配置说明见 README）
+.vscode/
+
+# Python
+__pycache__/
+*.pyc

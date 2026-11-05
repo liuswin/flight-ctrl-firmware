@@ -1,0 +1,12 @@
+# flight-ctrl 默认配置
+CONFIG_IDF_TARGET="esp32c2"
+
+# 日志级别
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# 任务看门狗：控制任务有自己的节拍，暂不需要监控
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
+# 开启 HTTP 服务器 WebSocket 支持（默认关闭）
+CONFIG_HTTPD_WS_SUPPORT=y
+CONFIG_HTTPD_QUEUE_WORK_BLOCKING=y
