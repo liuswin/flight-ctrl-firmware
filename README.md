@@ -83,6 +83,27 @@ arduino-cli compile --fqbn esp32:esp32:esp32c3 \
 - ESP32 的 ADC 存在非线性，±30° 范围内影响很小；"相对角度 + 开机校准"方案
   会把传感器的零偏误差自动抵消掉
 
+## 早期 ESP8684 工程样片排障实录（2026-11）
+
+实测一块 DOIT ESP-C2-12 载板（FCC 2AL3B-ESPC2-12，ROM `esp8684-api2-20220127`，
+efuse v0.1）为**量产前工程样片**，固件层已修复三个 erratum，最终仍有一个硅片级
+缺陷无法绕过。全记录供同款板参考：
+
+| # | 症状 | 根因 | 修复（已含在本固件） |
+|---|---|---|---|
+| 1 | `assert failed: xTaskDelayUntil (xTimeIncrement > 0)`，~1.5s 重启循环 | IDF 默认 tick 100Hz，5ms 循环换算 tick=0 | `sdkconfig.defaults` 设 `CONFIG_FREERTOS_HZ=1000` + 代码兜底 `loop_tick` |
+| 2 | `rst:0x7 TG0WDT_SYS_RST`，`app_main` 返回后 ~2ms 静默硬复位 | bootloader 的 TG0 flashboot 看门狗无人接管 | `kill_flashboot_wdt()`：TIMG_WDTWPROTECT 密钥 `0x50D83AA1` 后写 0 |
+| 3 | `rst:0x10 RTCWDT_RTC_RST`，~7.2s 周期复位；C2 的 IDF 无 RTC WDT 驱动且头文件密钥(0xFFFFFFFF)是占位错误 | RTC 看门狗无人喂 | 同函数裸寄存器关闭，实测有效密钥同为 `0x50D83AA1` |
+| 4 | 二次启动起 `Image hash failed`，GD 闪存"损坏"循环 | WDT 暴毙时闪存状态异常的次生现象 | 随 #2/#3 修复自动消失，无需降频 |
+| 5 | **WiFi AP 启动 ~1.5s 后 systimer 计数器冻结**：esp_timer 停走、所有任务 delay 后永眠、串口静默、信标停发（热点空中不可见）。LED 常亮实验证实调度器冻结 | 硅片级缺陷（IDF v5.1/v5.5 均复现；`esp_wifi_set_ps(WIFI_PS_NONE)` 无效） | **无法绕过**，判定工程样片不合格 |
+
+其他实证：该模组手册的 UART0/下载引脚与标准 ESP32-C2 不同（RXD0/TXD0=GPIO19/20、
+下载引脚 IO9 而非 GPIO8、GPIO8 未引出）；载板 USB-C 座子缺 CC 下拉电阻（C-C 线
+不供电，A-C 数据线可用）；串口日志波特率 74880（非 115200）。
+
+**结论**：同款板若症状一致，直接换板（推荐带原生 USB 的 ESP32-C3 DevKitM-1，
+本固件 `idf.py set-target esp32c3` 即可移植）。
+
 ## 硬件排障记录（2026-11 第一块 DOIT ESP-C2-12 载板，判定损坏）
 
 症状与排查结论，供退换举证或遇到同类问题时参考：

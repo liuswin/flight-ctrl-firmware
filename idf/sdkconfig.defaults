@@ -10,3 +10,15 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
 # 开启 HTTP 服务器 WebSocket 支持（默认关闭）
 CONFIG_HTTPD_WS_SUPPORT=y
 CONFIG_HTTPD_QUEUE_WORK_BLOCKING=y
+
+# 控制 5ms 循环需要 1000Hz tick（默认 100Hz 会让 pdMS_TO_TICKS(5)=0 触发断言）
+CONFIG_FREERTOS_HZ=1000
+
+# 这块板: 早期 ESP8684 + GD 4MB flash，60MHz 读取不稳（镜像哈希偶发失败+看门狗）
+# 降到 40MHz 并按真实容量 4MB 配置
+CONFIG_ESPTOOLPY_FLASHFREQ_30M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# C2 单定时器组：任务看门狗走 esp_timer，bootloader 的 TG0 硬件看门狗
+# 必须在用户代码里显式关闭，否则 ~1.7s 必被静默硬复位
+CONFIG_BOOTLOADER_WDT_DISABLE_IN_USER_CODE=y

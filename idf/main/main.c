@@ -31,6 +31,9 @@
 #include "esp_wifi.h"
 #include "esp_http_server.h"
 #include "driver/gpio.h"
+#include "soc/timer_group_reg.h"
+#include "soc/timer_group_struct.h"
+#include "soc/rtc_cntl_reg.h"
 
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
@@ -267,6 +270,9 @@ static void wifi_init_softap(void) {
 
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_cfg));
+  // 早期 ESP8684 硅片：AP 启动后 modem sleep 会错误地门控 systimer 时钟，
+  // 时间在 ~1.5s 冻结（任务停摆、信标停发）。关闭省电模式规避。
+  ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
   ESP_ERROR_CHECK(esp_wifi_start());
 
   ESP_LOGI(TAG, "热点已建立：%s  密码：%s  面板：http://192.168.4.1/", ssid, AP_PASSWORD);
@@ -287,9 +293,12 @@ static void control_task(void *arg) {
   TickType_t last_wake = xTaskGetTickCount();
   uint32_t next_sample = 0, next_send = 0;
   bool led_level = false;
+  // 注意：tick 频率若低于 200Hz，pdMS_TO_TICKS(5) 会等于 0 导致断言崩溃，
+  // sdkconfig.defaults 已设 CONFIG_FREERTOS_HZ=1000，这里再兜底防御
+  const TickType_t loop_tick = pdMS_TO_TICKS(5) > 0 ? pdMS_TO_TICKS(5) : 1;
 
   while (1) {
-    vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(5));
+    vTaskDelayUntil(&last_wake, loop_tick);
     uint32_t now = (uint32_t)((esp_timer_get_time() / 1000LL) - g_boot_ms);
 
     if (now >= next_sample) {
@@ -322,7 +331,39 @@ static void control_task(void *arg) {
 }
 
 // ---------------- 入口 ----------------
+// 早期 ESP8684 硅片（ROM 2022-01）erratum：ROM 启动的 TG0 flashboot 看门狗
+// 不会被 IDF 5.5 的常规流程关闭，~1.7s 后静默硬复位（rst:0x7 TG0WDT_SYS_RST）。
+// 这里在进 main 后第一件事用寄存器操作强杀它。
+static void kill_flashboot_wdt(void) {
+  uint32_t before = READ_PERI_REG(TIMG_WDTCONFIG0_REG(0));
+  WRITE_PERI_REG(TIMG_WDTWPROTECT_REG(0), 0x50D83AA1);   // 解除写保护
+  WRITE_PERI_REG(TIMG_WDTCONFIG0_REG(0), 0);             // 关 WDT（含 flashboot_en）
+  WRITE_PERI_REG(TIMG_WDTCONFIG1_REG(0), 0);             // 超时清零
+  WRITE_PERI_REG(TIMG_WDTWPROTECT_REG(0), 0);            // 恢复写保护
+  uint32_t after = READ_PERI_REG(TIMG_WDTCONFIG0_REG(0));
+  ESP_LOGD(TAG, "TG0 flashboot WDT cfg0: 0x%08lx -> 0x%08lx",
+           (unsigned long)before, (unsigned long)after);
+  // 早期 C2 上 bootloader 还会启用 RTC 看门狗（rst:0x10 RTCWDT_RTC_RST，~7.2s 咬人）。
+  // C2 的 IDF 没有 RTC WDT 驱动，且头文件里的写保护密钥(0xFFFFFFFF)是占位错误，
+  // 实测有效密钥与其他 ESP32 相同为 0x50D83AA1。
+  uint32_t rtc_before = READ_PERI_REG(RTC_CNTL_WDTCONFIG0_REG);
+  const uint32_t keys[] = {0x50D83AA1, 0xFFFFFFFF};
+  bool rtc_killed = false;
+  for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]) && !rtc_killed; i++) {
+    WRITE_PERI_REG(RTC_CNTL_WDTWPROTECT_REG, keys[i]);
+    WRITE_PERI_REG(RTC_CNTL_WDTCONFIG0_REG, 0);   // WDT_EN=0，所有阶段关闭
+    WRITE_PERI_REG(RTC_CNTL_WDTCONFIG1_REG, 0);   // 超时清零
+    rtc_killed = READ_PERI_REG(RTC_CNTL_WDTCONFIG0_REG) == 0;
+    WRITE_PERI_REG(RTC_CNTL_WDTWPROTECT_REG, 0);
+  }
+  ESP_LOGD(TAG, "RTC WDT cfg0: 0x%08lx -> 0x%08lx %s",
+           (unsigned long)rtc_before,
+           (unsigned long)READ_PERI_REG(RTC_CNTL_WDTCONFIG0_REG),
+           rtc_killed ? "已关闭" : "两种密钥均失败");
+}
+
 void app_main(void) {
+  kill_flashboot_wdt();
   g_boot_ms = esp_timer_get_time() / 1000LL;
 
   ESP_ERROR_CHECK(nvs_flash_init());
