@@ -17,10 +17,27 @@
 #define ADC_VREF_MV      3300   // 无校准时的粗略换算基准
 #define ADC_MAX_RAW      4095   // 12-bit
 
-// ============ WiFi 热点 ============
-#define AP_SSID_PREFIX  "FlightCtrl"   // 热点名前缀，上电追加 MAC 后两字节
+// ============ WiFi ============
+// STA 模式：连家里的路由器。
+// 密码写在 wifi_secrets.h 里（该文件已被 .gitignore 忽略，不会进仓库）。
+// 首次使用：复制 wifi_secrets.h.example 为 wifi_secrets.h 并填入你的 WiFi 信息。
+#if __has_include("wifi_secrets.h")
+#include "wifi_secrets.h"
+#else
+#define WIFI_SSID  "在这里填你家WiFi的名字"
+#define WIFI_PASS  "在这里填你家WiFi的密码"
+#endif
+
+// AP 保底模式：STA 连不上时，热点始终可用（IP 固定 192.168.4.1）
+#define AP_SSID_PREFIX  "FlightCtrl"   // 热点名前缀，上电追加 MAC 后缀
 #define AP_PASSWORD     "flywithme"    // 至少 8 位
 #define AP_CHANNEL      1
+
+// STA 连接超时（超时后仅靠 AP 热点模式运行，后台继续重试 STA）
+#define STA_TIMEOUT_MS  20000
+
+// mDNS 主机名：连上路由器后可用 http://flightctrl.local 访问
+#define MDNS_HOSTNAME   "flightctrl"
 
 // ============ 采样与滤波 ============
 #define SAMPLE_INTERVAL_MS   20   // ADC 采样周期（50Hz）

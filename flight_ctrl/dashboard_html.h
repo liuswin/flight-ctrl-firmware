@@ -63,7 +63,9 @@ static const char DASHBOARD_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
   };
   function connect() {
     ws = new WebSocket('ws://' + location.hostname + ':81/');
-    ws.onopen = function () { el.dot.classList.add('on'); el.stxt.textContent = '已连接'; retry = 0; };
+    ws.onopen = function () { el.dot.classList.add('on'); el.stxt.textContent = '已连接'; retry = 0;
+      ws.send('{"cmd":"hello"}');  // 触发固件登记本客户端，开始接收广播
+    };
     ws.onclose = function () {
       el.dot.classList.remove('on'); el.stxt.textContent = '已断开，重连中…';
       setTimeout(connect, Math.min(1000 * ++retry, 5000));

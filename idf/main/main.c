@@ -30,6 +30,7 @@
 #include "esp_event.h"
 #include "esp_wifi.h"
 #include "esp_http_server.h"
+#include "mdns.h"
 #include "driver/gpio.h"
 #include "soc/timer_group_reg.h"
 #include "soc/timer_group_struct.h"
@@ -203,20 +204,20 @@ static esp_err_t ws_handler(httpd_req_t *req) {
   int fd = httpd_req_to_sockfd(req);
   ws_register(fd);
 
-  // payload=NULL：由服务端内部缓冲区接收，max_len 限制长度，指针仅在本次回调内有效
-  httpd_ws_frame_t pkt;
-  memset(&pkt, 0, sizeof(pkt));
+  uint8_t buf[64] = {0};
+  httpd_ws_frame_t pkt = {
+    .type = HTTPD_WS_TYPE_TEXT,
+    .payload = buf,
+    .len = sizeof(buf),
+  };
+  esp_err_t err = httpd_ws_recv_frame(req, &pkt, sizeof(buf) - 1);
 
-  esp_err_t err = httpd_ws_recv_frame(req, &pkt, 63);
-  if (err != ESP_OK) {
-    ws_unregister(fd);   // 读失败视为断线
-    return ESP_OK;
-  }
-  if (pkt.type == HTTPD_WS_TYPE_CLOSE) {
+  if (err == ESP_OK && pkt.type == HTTPD_WS_TYPE_CLOSE) {
     ws_unregister(fd);
     return ESP_OK;
   }
-  if (pkt.type == HTTPD_WS_TYPE_TEXT && pkt.payload &&
+  // 注意：解析失败/ping 等情况不注销，保持广播不断流
+  if (err == ESP_OK && pkt.type == HTTPD_WS_TYPE_TEXT &&
       strstr((char *)pkt.payload, "center")) {
     // 以当前姿势重新居中：当前绝对角 = 相对角 + 基准角
     g_roll_ref = g_roll + g_roll_ref;
@@ -250,32 +251,72 @@ static httpd_handle_t start_http_server(void) {
   return g_server;
 }
 
-// ---------------- WiFi 热点 ----------------
-static void wifi_init_softap(void) {
+// ---------------- WiFi：STA 连家里路由器 + AP 保底热点 ----------------
+static EventGroupHandle_t s_wifi_events;
+#define EVT_GOT_IP BIT0
+
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
+  if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+    esp_wifi_connect();   // 断线自动重连
+  } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+    ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;
+    ESP_LOGI(TAG, "已连入路由器，板子局域网 IP: " IPSTR, IP2STR(&evt->ip_info.ip));
+    // 注册 mDNS：之后可用 http://flightctrl.local 访问
+    if (mdns_init() == ESP_OK) {
+      mdns_hostname_set(MDNS_HOSTNAME);
+      mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+      ESP_LOGI(TAG, "mDNS 已注册：http://%s.local", MDNS_HOSTNAME);
+    }
+    xEventGroupSetBits(s_wifi_events, EVT_GOT_IP);
+  }
+}
+
+static void wifi_init_all(void) {
+  s_wifi_events = xEventGroupCreate();
+  esp_netif_create_default_wifi_sta();
   esp_netif_create_default_wifi_ap();
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
+  ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, wifi_event_handler, NULL));
+  ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
+
+  // AP 保底配置
   char ssid[32];
   uint8_t mac[6] = {0};
   ESP_ERROR_CHECK(esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP));
   snprintf(ssid, sizeof(ssid), "%s-%02X%02X", AP_SSID_PREFIX, mac[4], mac[5]);
 
-  wifi_config_t wifi_cfg = { 0 };
-  strlcpy((char *)wifi_cfg.ap.ssid, ssid, sizeof(wifi_cfg.ap.ssid));
-  strlcpy((char *)wifi_cfg.ap.password, AP_PASSWORD, sizeof(wifi_cfg.ap.password));
-  wifi_cfg.ap.channel = AP_CHANNEL;
-  wifi_cfg.ap.max_connection = 4;
-  wifi_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
+  wifi_config_t ap_cfg = { 0 };
+  strlcpy((char *)ap_cfg.ap.ssid, ssid, sizeof(ap_cfg.ap.ssid));
+  strlcpy((char *)ap_cfg.ap.password, AP_PASSWORD, sizeof(ap_cfg.ap.password));
+  ap_cfg.ap.channel = AP_CHANNEL;
+  ap_cfg.ap.max_connection = 4;
+  ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
 
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_cfg));
-  // 早期 ESP8684 硅片：AP 启动后 modem sleep 会错误地门控 systimer 时钟，
-  // 时间在 ~1.5s 冻结（任务停摆、信标停发）。关闭省电模式规避。
+  // STA 配置（家里路由器）
+  wifi_config_t sta_cfg = { 0 };
+  strlcpy((char *)sta_cfg.sta.ssid, WIFI_SSID, sizeof(sta_cfg.sta.ssid));
+  strlcpy((char *)sta_cfg.sta.password, WIFI_PASS, sizeof(sta_cfg.sta.password));
+
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+  // 早期 ESP8684 硅片 erratum：modem sleep 冻结 systimer；关闭省电（对 C3 无害）
   ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
   ESP_ERROR_CHECK(esp_wifi_start());
+  esp_wifi_connect();
 
-  ESP_LOGI(TAG, "热点已建立：%s  密码：%s  面板：http://192.168.4.1/", ssid, AP_PASSWORD);
+  ESP_LOGI(TAG, "保底热点：%s（密码 %s，IP 192.168.4.1）", ssid, AP_PASSWORD);
+  ESP_LOGI(TAG, "正在连接路由器 \"%s\"（最多等 %d 秒）...",
+           WIFI_SSID, STA_TIMEOUT_MS / 1000);
+
+  EventBits_t bits = xEventGroupWaitBits(s_wifi_events, EVT_GOT_IP,
+                                         pdFALSE, pdFALSE,
+                                         pdMS_TO_TICKS(STA_TIMEOUT_MS));
+  if (!(bits & EVT_GOT_IP)) {
+    ESP_LOGW(TAG, "路由器连接超时，继续后台重试；当前可用保底热点 %s", ssid);
+  }
 }
 
 // ---------------- 主任务 ----------------
@@ -390,7 +431,7 @@ void app_main(void) {
   ESP_LOGI(TAG, "校准完成：基准 roll=%.1f pitch=%.1f 重力模长=%.2fg",
            g_roll_ref, g_pitch_ref, g_gravity_norm);
 
-  wifi_init_softap();
+  wifi_init_all();
   start_http_server();
 
   xTaskCreate(control_task, "ctrl", 4096, NULL, 5, NULL);

@@ -15,10 +15,18 @@ ESP32-C2（NodeMCU-ESP32-C2 / ESP8684）读取 GY-61（ADXL335 三轴模拟加�
 
 ## 使用流程
 
-1. **上电后前 1 秒为校准阶段**：把板子保持在你想要的"中立握姿"静止不动
-2. 电脑/手机连接热点 **FlightCtrl-XXXX**（XXXX 为设备 MAC 后缀），密码 `flywithme`
-3. 浏览器打开 **http://192.168.4.1** —— 板载调试面板实时显示倾角和地平仪，可一键重新居中
-4. 数据流地址：**ws://192.168.4.1/ws**
+固件为 **STA+AP 双模**：板子自动连家里路由器（常驻局域网），同时保留
+`FlightCtrl-XXXX` 热点作保底（连不上路由器时用，IP 固定 192.168.4.1）。
+
+1. **首次配置**：复制 `idf/main/wifi_secrets.h.example` 为 `idf/main/wifi_secrets.h`，
+   填入家里 WiFi 的名称和**2.4GHz**网络（ESP32 不支持 5G！）与密码。
+   该文件已被 .gitignore 忽略，不会入库
+2. 烧录上电，**保持握姿静止 1 秒**（校准）
+3. 电脑（与板子同一路由器下）打开 **http://flightctrl.local** —— 实时倾角面板
+   （也可用串口日志里打印的 IP 直接访问）
+4. 数据流：**ws://flightctrl.local/ws**（浏览器/Node/python 客户端连接后发一帧
+   `{"cmd":"hello"}` 开始接收广播）
+5. 面板"重新居中"按钮：发送 `{"cmd":"center"}`
 
 ## 数据协议
 

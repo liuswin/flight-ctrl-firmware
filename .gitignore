@@ -13,3 +13,6 @@ __pycache__/
 *.pyc
 # 旧硅片排查用的 v5.1 构建目录
 idf/build51/
+
+# WiFi 凭据（绝不入库）
+idf/main/wifi_secrets.h
