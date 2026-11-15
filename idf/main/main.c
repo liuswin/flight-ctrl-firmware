@@ -1,20 +1,23 @@
 /**
- * flight-ctrl 固件（ESP-IDF 版）— ESP32-C2 + GY-61(ADXL335) 体感飞控手柄
+ * flight-ctrl 固件 — ESP32-C3 + GY-61(ADXL335) 体感飞控手柄
  *
  * 功能：
- *   1. 上电建立 WiFi 热点（FlightCtrl-XXXX）
+ *   1. 上电连家里路由器（STA）+ 保底热点（AP），mDNS 注册 flightctrl.local
  *   2. 开机 1 秒静止校准（此刻握姿即"中立位"）
  *   3. 50Hz 采样三轴加速度 → 横滚/俯仰 → 低通滤波
- *   4. 40Hz 向所有 WebSocket 客户端推送 JSON（ws://192.168.4.1/ws）
- *   5. 内置调试面板（http://192.168.4.1/）
+ *   4. HTTP 轮询接口（客户端 25ms 拉一次即 40Hz）：
+ *      GET /tilt   → {"roll":-12.3,"pitch":4.5,"cr":-0.41,"cp":0.15,"ms":123456}
+ *      GET /center → 以当前姿势重新居中
+ *      GET /       → 调试面板页面
+ *      GET /health → {"status":"ok"}
  *
- * 数据：{"roll":-12.3,"pitch":4.5,"cr":-0.41,"cp":0.15,"ms":123456}
+ * 说明：曾实现 WebSocket 服务端推送，但 IDF 的 queue_work + 异步发送组合
+ * 在持续 40Hz 广播下会死锁 httpd 任务，改为客户端轮询架构（稳定可靠）。
  */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include <sys/param.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979f
@@ -46,19 +49,12 @@
 static const char *TAG = "flight-ctrl";
 
 // ---------------- 状态 ----------------
-static float g_roll = 0, g_pitch = 0;         // 滤波后的相对角度（度）
-static float g_roll_ref = 0, g_pitch_ref = 0; // 校准基准角
-static float g_gravity_norm = 1.0f;
-static int64_t g_boot_ms;
-
-static adc_oneshot_unit_handle_t g_adc1;
-static adc_cali_handle_t g_adc_cali[3];       // X/Y/Z 各一路校准句柄（可能为 NULL）
+static float g_roll = 0, g_pitch = 0;          // 滤波后的相对角度（度）
+static float g_g0[3] = {0, 0, 1};              // 校准时的参考重力向量（单位 g）
 static httpd_handle_t g_server;
 
-// WebSocket 客户端 fd 注册表
-#define WS_MAX_CLIENTS 4
-static int  g_ws_fd[WS_MAX_CLIENTS];
-static bool g_ws_used[WS_MAX_CLIENTS];
+static adc_oneshot_unit_handle_t g_adc1;
+static adc_cali_handle_t g_adc_cali[3];
 
 // ---------------- ADC ----------------
 static float read_axis_mv(int idx, adc_channel_t chan) {
@@ -75,20 +71,27 @@ static float mv_to_g(float mv) {
   return (mv - ADXL_ZERO_G_MV) / ADXL_SENS_MV_G;
 }
 
-// 由重力向量算横滚/俯仰（度）
-static void read_angles(float *roll_out, float *pitch_out, float *gnorm_out) {
-  float gx = mv_to_g(read_axis_mv(0, PIN_ADXL_X_CHAN));
-  float gy = mv_to_g(read_axis_mv(1, PIN_ADXL_Y_CHAN));
-  float gz = mv_to_g(read_axis_mv(2, PIN_ADXL_Z_CHAN));
-  *pitch_out = atan2f(-gx, sqrtf(gy * gy + gz * gz)) * (180.0f / M_PI);
-  *roll_out  = atan2f(gy, gz) * (180.0f / M_PI);
-  if (gnorm_out) *gnorm_out = sqrtf(gx * gx + gy * gy + gz * gz);
+// 读三轴加速度（单位 g）
+static void read_accel(float *gx, float *gy, float *gz) {
+  *gx = mv_to_g(read_axis_mv(0, PIN_ADXL_X_CHAN));
+  *gy = mv_to_g(read_axis_mv(1, PIN_ADXL_Y_CHAN));
+  *gz = mv_to_g(read_axis_mv(2, PIN_ADXL_Z_CHAN));
+}
+
+// 当前重力向量相对参考向量 g0 的旋转角（度）。
+// 用叉积/点积直接算"相对角"，而不是两个绝对角相减——
+// 避开 atan2 在 ±180° 的断点（板子安装方向靠近断点时，
+// 绝对角相减会出现 -340° 之类的跳变）。相对角在 ±180° 内连续。
+static void rel_angles(float gx, float gy, float gz,
+                       float *roll_out, float *pitch_out) {
+  *roll_out  = atan2f(g_g0[1] * gz - g_g0[2] * gy,
+                      g_g0[1] * gy + g_g0[2] * gz) * (180.0f / M_PI);
+  *pitch_out = atan2f(g_g0[2] * gx - g_g0[0] * gz,
+                      g_g0[0] * gx + g_g0[2] * gz) * (180.0f / M_PI);
 }
 
 static void adc_init(void) {
-  adc_oneshot_unit_init_cfg_t unit_cfg = {
-    .unit_id = ADC_UNIT_1,
-  };
+  adc_oneshot_unit_init_cfg_t unit_cfg = { .unit_id = ADC_UNIT_1 };
   ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &g_adc1));
 
   adc_channel_t chans[3] = {PIN_ADXL_X_CHAN, PIN_ADXL_Y_CHAN, PIN_ADXL_Z_CHAN};
@@ -99,8 +102,6 @@ static void adc_init(void) {
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(g_adc1, chans[i], &chan_cfg));
 
-    // C2 支持线性拟合校准（无出厂 eFuse 数据时用默认系数；
-    // 相对角度方案下残余误差会在开机校准时抵消）
     g_adc_cali[i] = NULL;
 #if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
     adc_cali_line_fitting_config_t cali_cfg = {
@@ -121,75 +122,44 @@ static void adc_init(void) {
   }
 }
 
-// ---------------- WebSocket 客户端管理 ----------------
-int ws_client_count(void);
-
-static void ws_register(int fd) {
-  for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-    if (g_ws_used[i] && g_ws_fd[i] == fd) return;   // 已注册
-  }
-  for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-    if (!g_ws_used[i]) {
-      g_ws_used[i] = true;
-      g_ws_fd[i] = fd;
-      ESP_LOGI(TAG, "WS 客户端接入 fd=%d（共 %d 个）", fd, ws_client_count());
-      return;
-    }
-  }
-  ESP_LOGW(TAG, "WS 客户端满，拒绝 fd=%d", fd);
+// ---------------- 映射 ----------------
+static float apply_deadzone(float a) {
+  return (a > -DEADZONE_DEG && a < DEADZONE_DEG) ? 0 : a;
+}
+static float map_to_control(float angle) {
+  float c = angle / MAX_TILT_DEG;
+  return c > 1 ? 1 : (c < -1 ? -1 : c);
 }
 
-static void ws_unregister(int fd) {
-  for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-    if (g_ws_used[i] && g_ws_fd[i] == fd) {
-      g_ws_used[i] = false;
-      ESP_LOGI(TAG, "WS 客户端断开 fd=%d", fd);
-      return;
-    }
+// ---------------- HTTP 服务 ----------------
+static esp_err_t tilt_get_handler(httpd_req_t *req) {
+  char json[96];
+  snprintf(json, sizeof(json),
+           "{\"roll\":%.1f,\"pitch\":%.1f,\"cr\":%.2f,\"cp\":%.2f,\"ms\":%lu}",
+           apply_deadzone(g_roll), apply_deadzone(g_pitch),
+           map_to_control(g_roll), map_to_control(g_pitch),
+           (unsigned long)(esp_timer_get_time() / 1000LL));
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");  // 游戏页面跨域拉取
+  return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t center_get_handler(httpd_req_t *req) {
+  // 重新居中 = 以当前重力向量为新参考（快速采 64 次取平均，抗手抖）
+  float sx = 0, sy = 0, sz = 0;
+  for (int i = 0; i < 64; i++) {
+    float gx, gy, gz;
+    read_accel(&gx, &gy, &gz);
+    sx += gx; sy += gy; sz += gz;
+    vTaskDelay(pdMS_TO_TICKS(2));
   }
+  g_g0[0] = sx / 64; g_g0[1] = sy / 64; g_g0[2] = sz / 64;
+  g_roll = 0; g_pitch = 0;
+  ESP_LOGI(TAG, "已重新居中");
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
-int ws_client_count(void) {
-  int n = 0;
-  for (int i = 0; i < WS_MAX_CLIENTS; i++) n += g_ws_used[i];
-  return n;
-}
-
-// 广播任务：通过 httpd_queue_work 切到 httpd 任务上下文再发送
-typedef struct {
-  int fd;
-  char payload[96];
-} ws_send_job_t;
-
-static void ws_send_worker(void *arg) {
-  ws_send_job_t *job = arg;
-  httpd_ws_frame_t pkt = {
-    .type = HTTPD_WS_TYPE_TEXT,
-    .payload = (uint8_t *)job->payload,
-    .len = strlen(job->payload),
-    .final = true,
-  };
-  if (httpd_ws_send_frame_async(g_server, job->fd, &pkt) != ESP_OK) {
-    ws_unregister(job->fd);   // 发送失败视为断线
-  }
-  free(job);
-}
-
-static void ws_broadcast(const char *json) {
-  for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-    if (!g_ws_used[i]) continue;
-    ws_send_job_t *job = malloc(sizeof(*job));
-    if (!job) continue;
-    job->fd = g_ws_fd[i];
-    strlcpy(job->payload, json, sizeof(job->payload));
-    if (httpd_queue_work(g_server, ws_send_worker, job) != ESP_OK) {
-      ws_unregister(job->fd);
-      free(job);
-    }
-  }
-}
-
-// ---------------- HTTP / WS 处理 ----------------
 static esp_err_t dashboard_get_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html; charset=utf-8");
   return httpd_resp_send(req, DASHBOARD_HTML, HTTPD_RESP_USE_STRLEN);
@@ -200,54 +170,22 @@ static esp_err_t health_get_handler(httpd_req_t *req) {
   return httpd_resp_send(req, "{\"status\":\"ok\"}", HTTPD_RESP_USE_STRLEN);
 }
 
-static esp_err_t ws_handler(httpd_req_t *req) {
-  int fd = httpd_req_to_sockfd(req);
-  ws_register(fd);
-
-  uint8_t buf[64] = {0};
-  httpd_ws_frame_t pkt = {
-    .type = HTTPD_WS_TYPE_TEXT,
-    .payload = buf,
-    .len = sizeof(buf),
-  };
-  esp_err_t err = httpd_ws_recv_frame(req, &pkt, sizeof(buf) - 1);
-
-  if (err == ESP_OK && pkt.type == HTTPD_WS_TYPE_CLOSE) {
-    ws_unregister(fd);
-    return ESP_OK;
-  }
-  // 注意：解析失败/ping 等情况不注销，保持广播不断流
-  if (err == ESP_OK && pkt.type == HTTPD_WS_TYPE_TEXT &&
-      strstr((char *)pkt.payload, "center")) {
-    // 以当前姿势重新居中：当前绝对角 = 相对角 + 基准角
-    g_roll_ref = g_roll + g_roll_ref;
-    g_pitch_ref = g_pitch + g_pitch_ref;
-    ESP_LOGI(TAG, "已重新居中");
-  }
-  return ESP_OK;
-}
-
 static httpd_handle_t start_http_server(void) {
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-  cfg.max_uri_handlers = 4;
+  cfg.max_uri_handlers = 6;
   cfg.server_port = 80;
-  cfg.ctrl_port = 32768;
 
   if (httpd_start(&g_server, &cfg) != ESP_OK) return NULL;
 
-  httpd_uri_t uri_dashboard = {
-    .uri = "/", .method = HTTP_GET, .handler = dashboard_get_handler,
+  httpd_uri_t uris[] = {
+    { .uri = "/",      .method = HTTP_GET, .handler = dashboard_get_handler },
+    { .uri = "/tilt",  .method = HTTP_GET, .handler = tilt_get_handler },
+    { .uri = "/center",.method = HTTP_GET, .handler = center_get_handler },
+    { .uri = "/health",.method = HTTP_GET, .handler = health_get_handler },
   };
-  httpd_uri_t uri_health = {
-    .uri = "/health", .method = HTTP_GET, .handler = health_get_handler,
-  };
-  httpd_uri_t uri_ws = {
-    .uri = "/ws", .method = HTTP_GET, .handler = ws_handler,
-    .is_websocket = true, .handle_ws_control_frames = true,
-  };
-  httpd_register_uri_handler(g_server, &uri_dashboard);
-  httpd_register_uri_handler(g_server, &uri_health);
-  httpd_register_uri_handler(g_server, &uri_ws);
+  for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
+    httpd_register_uri_handler(g_server, &uris[i]);
+  }
   return g_server;
 }
 
@@ -261,7 +199,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
   } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
     ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;
     ESP_LOGI(TAG, "已连入路由器，板子局域网 IP: " IPSTR, IP2STR(&evt->ip_info.ip));
-    // 注册 mDNS：之后可用 http://flightctrl.local 访问
     if (mdns_init() == ESP_OK) {
       mdns_hostname_set(MDNS_HOSTNAME);
       mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
@@ -281,7 +218,6 @@ static void wifi_init_all(void) {
   ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, wifi_event_handler, NULL));
   ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
 
-  // AP 保底配置
   char ssid[32];
   uint8_t mac[6] = {0};
   ESP_ERROR_CHECK(esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP));
@@ -294,7 +230,6 @@ static void wifi_init_all(void) {
   ap_cfg.ap.max_connection = 4;
   ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
 
-  // STA 配置（家里路由器）
   wifi_config_t sta_cfg = { 0 };
   strlcpy((char *)sta_cfg.sta.ssid, WIFI_SSID, sizeof(sta_cfg.sta.ssid));
   strlcpy((char *)sta_cfg.sta.password, WIFI_PASS, sizeof(sta_cfg.sta.password));
@@ -320,54 +255,36 @@ static void wifi_init_all(void) {
 }
 
 // ---------------- 主任务 ----------------
-static float apply_deadzone(float a) {
-  return (a > -DEADZONE_DEG && a < DEADZONE_DEG) ? 0 : a;
-}
-
-static float map_to_control(float angle) {
-  float c = angle / MAX_TILT_DEG;
-  return c > 1 ? 1 : (c < -1 ? -1 : c);
-}
-
 static void control_task(void *arg) {
   (void)arg;
   TickType_t last_wake = xTaskGetTickCount();
-  uint32_t next_sample = 0, next_send = 0;
+  uint32_t next_sample = 0;
   bool led_level = false;
-  // 注意：tick 频率若低于 200Hz，pdMS_TO_TICKS(5) 会等于 0 导致断言崩溃，
-  // sdkconfig.defaults 已设 CONFIG_FREERTOS_HZ=1000，这里再兜底防御
+  // tick 频率若低于 200Hz，pdMS_TO_TICKS(5) 会等于 0 导致断言崩溃，兜底防御
   const TickType_t loop_tick = pdMS_TO_TICKS(5) > 0 ? pdMS_TO_TICKS(5) : 1;
 
   while (1) {
     vTaskDelayUntil(&last_wake, loop_tick);
-    uint32_t now = (uint32_t)((esp_timer_get_time() / 1000LL) - g_boot_ms);
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000LL);
 
     if (now >= next_sample) {
       next_sample = now + SAMPLE_INTERVAL_MS;
-      float r, p;
-      read_angles(&r, &p, NULL);
-      r -= g_roll_ref;
-      p -= g_pitch_ref;
-      g_roll += EMA_ALPHA * (r - g_roll);
+      float gx, gy, gz, r, p;
+      read_accel(&gx, &gy, &gz);
+      rel_angles(gx, gy, gz, &r, &p);
+      g_roll  += EMA_ALPHA * (r - g_roll);
       g_pitch += EMA_ALPHA * (p - g_pitch);
     }
 
-    if (now >= next_send) {
-      next_send = now + SEND_INTERVAL_MS;
-      if (ws_client_count() > 0) {
-        char json[96];
-        snprintf(json, sizeof(json),
-                 "{\"roll\":%.1f,\"pitch\":%.1f,\"cr\":%.2f,\"cp\":%.2f,\"ms\":%lu}",
-                 apply_deadzone(g_roll), apply_deadzone(g_pitch),
-                 map_to_control(g_roll), map_to_control(g_pitch),
-                 (unsigned long)now);
-        ws_broadcast(json);
-      }
 #if LED_GPIO >= 0
+    // 1Hz 心跳灯：活着就在闪
+    static uint32_t last_led = 0;
+    if (now - last_led >= 500) {
+      last_led = now;
       led_level = !led_level;
-      gpio_set_level(LED_GPIO, ws_client_count() > 0 ? led_level : 0);
-#endif
+      gpio_set_level(LED_GPIO, led_level);
     }
+#endif
   }
 }
 
@@ -376,36 +293,26 @@ static void control_task(void *arg) {
 // 不会被 IDF 5.5 的常规流程关闭，~1.7s 后静默硬复位（rst:0x7 TG0WDT_SYS_RST）。
 // 这里在进 main 后第一件事用寄存器操作强杀它。
 static void kill_flashboot_wdt(void) {
-  uint32_t before = READ_PERI_REG(TIMG_WDTCONFIG0_REG(0));
   WRITE_PERI_REG(TIMG_WDTWPROTECT_REG(0), 0x50D83AA1);   // 解除写保护
   WRITE_PERI_REG(TIMG_WDTCONFIG0_REG(0), 0);             // 关 WDT（含 flashboot_en）
   WRITE_PERI_REG(TIMG_WDTCONFIG1_REG(0), 0);             // 超时清零
   WRITE_PERI_REG(TIMG_WDTWPROTECT_REG(0), 0);            // 恢复写保护
-  uint32_t after = READ_PERI_REG(TIMG_WDTCONFIG0_REG(0));
-  ESP_LOGD(TAG, "TG0 flashboot WDT cfg0: 0x%08lx -> 0x%08lx",
-           (unsigned long)before, (unsigned long)after);
-  // 早期 C2 上 bootloader 还会启用 RTC 看门狗（rst:0x10 RTCWDT_RTC_RST，~7.2s 咬人）。
-  // C2 的 IDF 没有 RTC WDT 驱动，且头文件里的写保护密钥(0xFFFFFFFF)是占位错误，
+  // 同一硅片上 bootloader 还会启用 RTC 看门狗（rst:0x10 RTCWDT_RTC_RST）。
+  // C2 的 IDF 没有 RTC WDT 驱动且头文件密钥(0xFFFFFFFF)是占位错误，
   // 实测有效密钥与其他 ESP32 相同为 0x50D83AA1。
-  uint32_t rtc_before = READ_PERI_REG(RTC_CNTL_WDTCONFIG0_REG);
   const uint32_t keys[] = {0x50D83AA1, 0xFFFFFFFF};
-  bool rtc_killed = false;
-  for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]) && !rtc_killed; i++) {
+  for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
     WRITE_PERI_REG(RTC_CNTL_WDTWPROTECT_REG, keys[i]);
     WRITE_PERI_REG(RTC_CNTL_WDTCONFIG0_REG, 0);   // WDT_EN=0，所有阶段关闭
     WRITE_PERI_REG(RTC_CNTL_WDTCONFIG1_REG, 0);   // 超时清零
-    rtc_killed = READ_PERI_REG(RTC_CNTL_WDTCONFIG0_REG) == 0;
+    bool done = READ_PERI_REG(RTC_CNTL_WDTCONFIG0_REG) == 0;
     WRITE_PERI_REG(RTC_CNTL_WDTWPROTECT_REG, 0);
+    if (done) break;
   }
-  ESP_LOGD(TAG, "RTC WDT cfg0: 0x%08lx -> 0x%08lx %s",
-           (unsigned long)rtc_before,
-           (unsigned long)READ_PERI_REG(RTC_CNTL_WDTCONFIG0_REG),
-           rtc_killed ? "已关闭" : "两种密钥均失败");
 }
 
 void app_main(void) {
   kill_flashboot_wdt();
-  g_boot_ms = esp_timer_get_time() / 1000LL;
 
   ESP_ERROR_CHECK(nvs_flash_init());
   ESP_ERROR_CHECK(esp_netif_init());
@@ -418,18 +325,19 @@ void app_main(void) {
 
   adc_init();
   ESP_LOGI(TAG, "开始校准（保持中立握姿静止约 1 秒）...");
-  float r = 0, p = 0, gn = 0;
+  float sx = 0, sy = 0, sz = 0, gn = 0;
   for (int i = 0; i < CALIB_SAMPLES; i++) {
-    float ri, pi, gi;
-    read_angles(&ri, &pi, &gi);
-    r += ri; p += pi; gn += gi;
+    float gx, gy, gz;
+    read_accel(&gx, &gy, &gz);
+    sx += gx; sy += gy; sz += gz;
+    gn += sqrtf(gx * gx + gy * gy + gz * gz);
     vTaskDelay(pdMS_TO_TICKS(1));
   }
-  g_roll_ref = r / CALIB_SAMPLES;
-  g_pitch_ref = p / CALIB_SAMPLES;
-  g_gravity_norm = gn / CALIB_SAMPLES;
-  ESP_LOGI(TAG, "校准完成：基准 roll=%.1f pitch=%.1f 重力模长=%.2fg",
-           g_roll_ref, g_pitch_ref, g_gravity_norm);
+  g_g0[0] = sx / CALIB_SAMPLES;
+  g_g0[1] = sy / CALIB_SAMPLES;
+  g_g0[2] = sz / CALIB_SAMPLES;
+  ESP_LOGI(TAG, "校准完成：参考向量 (%.2f, %.2f, %.2f) 重力模长=%.2fg",
+           g_g0[0], g_g0[1], g_g0[2], gn / CALIB_SAMPLES);
 
   wifi_init_all();
   start_http_server();

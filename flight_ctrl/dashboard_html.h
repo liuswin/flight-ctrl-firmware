@@ -38,7 +38,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
 </head>
 <body>
   <h1>FlightCtrl 调试面板</h1>
-  <div class="sub">ESP32-C2 + GY-61 倾角数据流</div>
+  <div class="sub">ESP32-C3 + GY-61 倾角数据（40Hz 轮询）</div>
   <div class="status"><span class="dot" id="dot"></span><span id="stxt">连接中…</span></div>
   <div class="grid">
     <div class="card"><label>横滚 ROLL（°）</label>
@@ -53,7 +53,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
   <div class="meta" id="meta">-- msg/s</div>
 <script>
 (function () {
-  var ws, retry = 0, lastMsgT = 0, count = 0, rateT = performance.now();
+  var timer = null, count = 0, rateT = performance.now(), retry = 0;
   var el = {
     dot: document.getElementById('dot'), stxt: document.getElementById('stxt'),
     roll: document.getElementById('roll'), pitch: document.getElementById('pitch'),
@@ -61,20 +61,15 @@ static const char DASHBOARD_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
     meta: document.getElementById('meta'),
     horizon: document.getElementById('horizon'),
   };
-  function connect() {
-    ws = new WebSocket('ws://' + location.hostname + ':81/');
-    ws.onopen = function () { el.dot.classList.add('on'); el.stxt.textContent = '已连接'; retry = 0;
-      ws.send('{"cmd":"hello"}');  // 触发固件登记本客户端，开始接收广播
-    };
-    ws.onclose = function () {
-      el.dot.classList.remove('on'); el.stxt.textContent = '已断开，重连中…';
-      setTimeout(connect, Math.min(1000 * ++retry, 5000));
-    };
-    ws.onmessage = function (e) {
-      var d; try { d = JSON.parse(e.data); } catch (err) { return; }
+  function setConn(on) {
+    el.dot.classList.toggle('on', on);
+    el.stxt.textContent = on ? '已连接' : '连接中…';
+  }
+  function poll() {
+    fetch('/tilt').then(function (r) { return r.json(); }).then(function (d) {
+      setConn(true); retry = 0;
       el.roll.textContent = d.roll.toFixed(1);
       el.pitch.textContent = d.pitch.toFixed(1);
-      // 归一化值 [-1,1] → 进度条（中心为 0）
       el.rollbar.style.width = Math.abs(d.cr) * 50 + '%';
       el.rollbar.style.left = d.cr < 0 ? (50 - Math.abs(d.cr) * 50) + '%' : '50%';
       el.pitchbar.style.width = Math.abs(d.cp) * 50 + '%';
@@ -83,10 +78,18 @@ static const char DASHBOARD_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
       count++;
       var now = performance.now();
       if (now - rateT > 1000) {
-        el.meta.textContent = (count * 1000 / (now - rateT)).toFixed(0) + ' msg/s';
+        el.meta.textContent = (count * 1000 / (now - rateT)).toFixed(0) + ' 次/秒';
         count = 0; rateT = now;
       }
-    };
+    }).catch(function () {
+      setConn(false);
+      if (++retry > 3) { clearInterval(timer); setTimeout(start, 2000); }
+    });
+  }
+  function start() {
+    setConn(false);
+    timer = setInterval(poll, 25);   // 40Hz 轮询
+    poll();
   }
   // 简易地平仪：天地分界线随横滚旋转、随俯仰上下移动
   var ctx = el.horizon.getContext('2d');
@@ -110,9 +113,9 @@ static const char DASHBOARD_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
     ctx.lineTo(cx + 20, cy); ctx.lineTo(cx + 70, cy); ctx.stroke();
   }
   document.getElementById('center').onclick = function () {
-    if (ws && ws.readyState === 1) ws.send('{"cmd":"center"}');
+    fetch('/center');
   };
-  connect();
+  start();
 })();
 </script>
 </body>
